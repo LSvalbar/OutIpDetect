@@ -1,0 +1,8 @@
+/target
+/target-*
+**/*.rs.bk
+*.pdb
+/.agents
+/.claude
+/.codegraph
+/.codex

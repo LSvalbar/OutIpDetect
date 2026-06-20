@@ -1,0 +1,46 @@
+[package]
+name = "ipdetect"
+version = "0.1.0"
+edition = "2021"
+description = "TrafficMonitor plugin for displaying the current proxy exit IP and country code"
+license = "MIT"
+repository = "https://github.com/LSvalbar/OutIpDetect"
+homepage = "https://github.com/LSvalbar/OutIpDetect"
+readme = "README.md"
+keywords = ["trafficmonitor", "windows", "proxy", "ip", "plugin"]
+categories = ["network-programming", "os::windows-apis"]
+
+# TrafficMonitor 插件动态库：cdylib 产物为 ipdetect.dll，导出 TMPluginGetInstance。
+# 库 crate 根为 src/lib.rs，仅包含插件、探测、代理和配置模块。
+[lib]
+name = "ipdetect"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# HTTP 客户端：禁用默认的 rustls，改用 native-tls（Windows 上走 SChannel，免 OpenSSL/ring 构建依赖）
+ureq = { version = "2", default-features = false, features = ["native-tls", "socks-proxy", "gzip"] }
+# 提供 TLS 连接器（Windows 上底层为 SChannel）
+native-tls = "0.2"
+# 读取 Windows 注册表中的系统代理设置
+winreg = "0.52"
+# 配置文件序列化
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# 解析多个免费出口 IP 接口返回的不同 JSON 结构
+serde_json = "1"
+
+# TrafficMonitor 自绘显示项所需的 Win32 GDI API
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+]
+
+[profile.release]
+opt-level = "z"      # 体积优先
+lto = true           # 链接期优化
+strip = true         # 去符号，进一步减小体积
+panic = "abort"      # 不展开栈，体积更小
+codegen-units = 1    # 更好的优化（牺牲编译速度）
