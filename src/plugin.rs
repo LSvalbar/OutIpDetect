@@ -18,8 +18,7 @@
 //! 头文件中各默认实现的虚函数我们仍需在虚表中列出（用安全的桩函数返回与默认实现一致的值）。
 
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Condvar, Mutex, Once, OnceLock};
 
 use windows::Win32::Foundation::{RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
@@ -52,12 +51,18 @@ fn to_utf16_nul(s: &str) -> Vec<u16> {
 static LATEST_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 /// 后台探测线程是否已启动（保证只启动一次）。
 static PROBE_STARTED: Once = Once::new();
-/// 后台线程运行标志（当前生命周期内一直为真；预留给将来停止用）。
-static RUNNING: AtomicBool = AtomicBool::new(true);
+/// 刷新请求信号：`bool` 为待处理标志，配合 `Condvar` 唤醒后台线程。
+/// 单击任务栏项或插件加载时置位，后台线程消费后执行一次探测。
+static REFRESH_SIGNAL: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
 
 /// 取得 LATEST_TEXT 的单例。
 fn latest_text() -> &'static Mutex<String> {
     LATEST_TEXT.get_or_init(|| Mutex::new(String::from("…")))
+}
+
+/// 取得刷新信号单例（待处理标志 + 条件变量）。
+fn refresh_signal() -> &'static (Mutex<bool>, Condvar) {
+    REFRESH_SIGNAL.get_or_init(|| (Mutex::new(false), Condvar::new()))
 }
 
 /// 读取当前展示文本（拷贝一份返回）。
@@ -68,43 +73,73 @@ fn read_latest_text() -> String {
         .unwrap_or_else(|_| "—".to_string())
 }
 
-/// 启动后台探测线程：循环「解析有效代理 + 探测一次」，把结果写入 LATEST_TEXT。
-/// 刷新间隔读取配置（最低 5 分钟）。多次调用只会真正启动一次。
+/// 覆盖写入展示文本（锁失败时静默丢弃，绝不 panic 跨越 FFI 边界）。
+fn write_latest_text(text: String) {
+    if let Ok(mut g) = latest_text().lock() {
+        *g = text;
+    }
+}
+
+/// 请求一次异步刷新：置位待处理标志并唤醒后台线程。
+/// 由单击事件（TM 的 UI 线程）和插件加载调用，立即返回、不阻塞调用方。
+fn request_refresh() {
+    let (lock, cvar) = refresh_signal();
+    if let Ok(mut pending) = lock.lock() {
+        *pending = true;
+        cvar.notify_one();
+    }
+}
+
+/// 后台探测线程主体：阻塞等待刷新请求，被唤醒后执行一次探测并写回结果。
+/// 不再使用定时器；只有单击或加载触发的请求才会发起网络请求。
+fn probe_worker_loop() {
+    loop {
+        // 阻塞等待，直到出现一次刷新请求，避免空转占用 CPU。
+        {
+            let (lock, cvar) = refresh_signal();
+            let mut pending = match lock.lock() {
+                Ok(guard) => guard,
+                Err(_) => return, // 锁中毒说明进程已异常，直接结束线程。
+            };
+            while !*pending {
+                pending = match cvar.wait(pending) {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+            }
+            *pending = false; // 消费本次请求。
+        }
+
+        // 立即给出反馈，让用户知道单击已被响应（探测可能耗时数秒）。
+        write_latest_text(String::from("刷新中…"));
+
+        // 每轮都重新读取配置，便于用户改配置后无需重启 TM 即可生效。
+        let cfg = Config::load();
+        // 手动代理覆盖：空字符串视为「不覆盖」。
+        let manual = if cfg.proxy_override.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.proxy_override.clone())
+        };
+        let eff = proxy::resolve_effective_proxy(manual.as_deref());
+
+        // 单个接口超时 5 秒，失败时由探测模块自动切换备用地址。
+        let timeout = std::time::Duration::from_secs(5);
+        match probe::probeWithFallback(&eff, Some(&cfg.probe_url), timeout) {
+            Ok(info) => write_latest_text(info.display_text()),
+            // 探测失败时给出简短提示，避免界面空白。
+            Err(e) => write_latest_text(format!("探测失败: {e}")),
+        }
+    }
+}
+
+/// 确保后台探测线程已启动，并在首次启动时立即请求一次探测（加载即显示）。
+/// 多次调用只会真正启动一次。
 fn ensure_probe_thread() {
     PROBE_STARTED.call_once(|| {
-        std::thread::spawn(|| {
-            // 每轮都重新读取配置，便于用户改配置后无需重启 TM 即可生效。
-            while RUNNING.load(Ordering::Relaxed) {
-                let cfg = Config::load();
-                // 手动代理覆盖：空字符串视为「不覆盖」。
-                let manual = if cfg.proxy_override.trim().is_empty() {
-                    None
-                } else {
-                    Some(cfg.proxy_override.clone())
-                };
-                let eff = proxy::resolve_effective_proxy(manual.as_deref());
-
-                // 单个接口超时 5 秒，失败时由探测模块自动切换备用地址。
-                let timeout = std::time::Duration::from_secs(5);
-                match probe::probeWithFallback(&eff, Some(&cfg.probe_url), timeout) {
-                    Ok(info) => {
-                        if let Ok(mut g) = latest_text().lock() {
-                            *g = info.display_text();
-                        }
-                    }
-                    Err(e) => {
-                        if let Ok(mut g) = latest_text().lock() {
-                            // 探测失败时给出简短提示，避免界面空白。
-                            *g = format!("探测失败: {e}");
-                        }
-                    }
-                }
-
-                // 免费接口最低每 5 分钟刷新一次，避免旧配置造成高频请求。
-                let secs = crate::config::effectiveRefreshSecs(cfg.refresh_secs);
-                std::thread::sleep(std::time::Duration::from_secs(secs));
-            }
-        });
+        std::thread::spawn(probe_worker_loop);
+        // 插件加载时自动探测一次，避免任务栏一开始是空白占位。
+        request_refresh();
     });
 }
 
@@ -205,6 +240,9 @@ const ITEM_SAMPLE: &str = "出口IP  JP  255.255.255.255";
 const ITEM_FALLBACK_WIDTH: c_int = 190;
 // 文本左右内边距，避免内容紧贴项目边界。
 const ITEM_HORIZONTAL_PADDING: c_int = 4;
+// MouseEventType::MT_CLICK：PluginInterface.h 中 MouseEventType 枚举的第 0 项（鼠标左键单击）。
+// 若实测单击不触发刷新，优先核对此常量是否与头文件枚举顺序一致。
+const MT_CLICK: c_int = 0;
 
 /// 清除宿主字体的旋转角度，确保中文和英文都按正常水平方向绘制。
 #[allow(non_snake_case)]
@@ -385,12 +423,17 @@ unsafe extern "system" fn item_get_width_ex(
 }
 unsafe extern "system" fn item_on_mouse_event(
     _this: *mut PluginItem,
-    _type: c_int,
+    event_type: c_int,
     _x: c_int,
     _y: c_int,
     _hwnd: *mut core::ffi::c_void,
     _flag: c_int,
 ) -> c_int {
+    // 鼠标左键单击触发一次异步刷新；真正的网络探测在后台线程进行，
+    // 此处只置信号并立即返回，绝不阻塞 TM 的 UI 线程。
+    if event_type == MT_CLICK {
+        request_refresh();
+    }
     0 // 返回 0：让 TM 继续做默认处理（如右键菜单）
 }
 unsafe extern "system" fn item_on_keboard_event(
@@ -536,7 +579,8 @@ unsafe extern "system" fn plugin_get_item(this: *mut Plugin, index: c_int) -> *m
     }
 }
 unsafe extern "system" fn plugin_data_required(this: *mut Plugin) {
-    // 主程序定时调用：此处确保后台线程已启动，并把最新文本刷入显示项缓存。
+    // 主程序定时调用：确保后台线程已启动，并把后台探测到的最新文本刷入显示项缓存。
+    // 注意：此处不再发起网络请求，探测只由单击或加载触发的后台线程完成。
     ensure_probe_thread();
     (*this).item.refresh_value();
 }
@@ -597,7 +641,7 @@ unsafe extern "system" fn plugin_is_command_checked(_this: *mut Plugin, _i: c_in
     0
 }
 unsafe extern "system" fn plugin_on_initialize(_this: *mut Plugin, _app: *mut core::ffi::c_void) {
-    // 插件加载时被调用：在此启动后台探测线程，尽早开始拿落地IP。
+    // 插件加载时被调用：启动后台探测线程并自动探测一次，尽早显示落地IP。
     ensure_probe_thread();
 }
 
